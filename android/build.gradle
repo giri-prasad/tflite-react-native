@@ -12,14 +12,18 @@ buildscript {
 apply plugin: 'com.android.library'
 
 android {
-    compileSdkVersion 23
-    buildToolsVersion "23.0.1"
+    compileSdkVersion 27
+    buildToolsVersion "27.0.3"
 
     defaultConfig {
-        minSdkVersion 16
-        targetSdkVersion 22
+        minSdkVersion 21
+        targetSdkVersion 26
         versionCode 1
         versionName "1.0"
+        multiDexEnabled true
+        // // Add the following two lines
+        renderscriptTargetApi 19
+        renderscriptSupportModeEnabled true
     }
     lintOptions {
         abortOnError false
@@ -31,6 +35,6 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.facebook.react:react-native:+'
+    implementation project(':ReactAndroid')
     implementation 'org.tensorflow:tensorflow-lite:+'
 }

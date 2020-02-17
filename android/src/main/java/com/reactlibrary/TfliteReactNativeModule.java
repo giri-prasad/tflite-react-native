@@ -4,11 +4,21 @@ package com.reactlibrary;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
 import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.graphics.BitmapFactory;
+import android.graphics.BlurMaskFilter;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
 import android.graphics.Matrix;
 import android.graphics.Canvas;
 import android.util.Base64;
+import android.util.Log;
+import android.support.v8.renderscript.RenderScript;
+import android.support.v8.renderscript.Allocation;
+import android.support.v8.renderscript.ScriptIntrinsicBlur;
+import android.support.v8.renderscript.Element;
 
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.ReactApplicationContext;
@@ -40,12 +50,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Vector;
+import java.util.Random;
+import java.util.Arrays;
 
 public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
 
   private final ReactApplicationContext reactContext;
   private Interpreter tfLite;
   private int inputSize = 0;
+  private int[] mSegmentColors;
+  private int[][] mSegmentBits;
+  private final static int NUM_CLASSES = 21; // total count of labels... I've added this..
+  private final static Random RANDOM = new Random(System.currentTimeMillis());
   private Vector<String> labels;
   float[][] labelProb;
   private static final int BYTES_PER_CHANNEL = 4;
@@ -137,20 +153,60 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
 
     InputStream inputStream = new FileInputStream(path.replace("file://", ""));
     Bitmap bitmapRaw = BitmapFactory.decodeStream(inputStream);
+    final int w = bitmapRaw.getWidth();
+    final int h = bitmapRaw.getHeight();
+    Log.i("Tflite","bitmapRaw width and height" + bitmapRaw.getWidth() + "---" + bitmapRaw.getHeight() + "--inputSize--" + inputSize);
 
-    Matrix matrix = getTransformationMatrix(bitmapRaw.getWidth(), bitmapRaw.getHeight(),
-        inputSize, inputSize, false);
+    float resizeRatio = (float) inputSize / Math.max(w, h);
+    int rw = Math.round(w * resizeRatio);
+    int rh = Math.round(h * resizeRatio);
 
+
+    // we gotta now resize the bitmap down (it becomes 257 * 193) and then extend the bitmap to 257 * 257
+    // then use getTransformationMatrix on this bitmap then scale it back to 1600 * 1200 and i guess everything should be fine,,,
+
+    //  tfResizeBilinear 
+
+    if (bitmapRaw == null) {   // handle later
+        return null;
+    }
+
+    Bitmap resized = Bitmap.createBitmap(rw, rh,
+            Bitmap.Config.ARGB_8888);
+
+    final Canvas canvas1 = new Canvas(resized);
+    canvas1.drawBitmap(bitmapRaw,
+            new Rect(0, 0, bitmapRaw.getWidth(), bitmapRaw.getHeight()),
+            new Rect(0, 0, rw, rh),
+            null);
+    Log.i("Tflite","bitmap resized tfResizeBilinear width 257 and height 193" + resized.getWidth() + "---" + resized.getHeight());
+    ///// now we have resized bitmap which is 257 * 193
+    
+    // now we extend the bitmap
+    
+    resized = BitmapUtils.extendBitmap(
+      resized, inputSize, inputSize, Color.BLACK);
+      
+    Log.i("Tflite","bitmap extended extendBitmap width 257 and height 257" + resized.getWidth() + "---" + resized.getHeight());
+    // now we have the extended bitmap with 257 * 257 
+
+    // Matrix matrix = getTransformationMatrix(bitmapRaw.getWidth(), bitmapRaw.getHeight(),
+    //     inputSize, inputSize, false);
+    // Log.i("Tflite","matrix from getTransformationMatrix" + "---" + matrix);
     int[] intValues = new int[inputSize * inputSize];
     int bytePerChannel = tensor.dataType() == DataType.UINT8 ? 1 : BYTES_PER_CHANNEL;
+    Log.i("Tflite","bytePerChannel must be 4---" + bytePerChannel);
     ByteBuffer imgData = ByteBuffer.allocateDirect(1 * inputSize * inputSize * inputChannels * bytePerChannel);
     imgData.order(ByteOrder.nativeOrder());
 
-    Bitmap bitmap = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888);
-    final Canvas canvas = new Canvas(bitmap);
-    canvas.drawBitmap(bitmapRaw, matrix, null);
-    bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+    // Bitmap bitmap = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888);
+    // final Canvas canvas = new Canvas(bitmap);
+    // canvas.drawBitmap(bitmapRaw, matrix, null);
+    // bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
+    resized.getPixels(intValues, 0, resized.getWidth(), 0, 0, resized.getWidth(), resized.getHeight());
+    imgData.rewind();
 
+    Log.i("Tflite","resized width and height" + resized.getWidth() + "---" + resized.getHeight());
     int pixel = 0;
     for (int i = 0; i < inputSize; ++i) {
       for (int j = 0; j < inputSize; ++j) {
@@ -426,19 +482,151 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
     int i = tfLite.getOutputTensor(0).numBytes();
     ByteBuffer output = ByteBuffer.allocateDirect(tfLite.getOutputTensor(0).numBytes());
     output.order(ByteOrder.nativeOrder());
+
+    output.rewind();
+
     tfLite.run(feedInputTensorImage(path, mean, std), output);
 
     if (output.position() != output.limit()) {
       callback.invoke("Unexpected output position", null);
       return;
     }
-    output.flip();
 
-    byte[] res = fetchArgmax(output, labelColors, outputType);
+    mSegmentBits = new int[inputSize][inputSize];
+    int w = 257;
+    int h = 257;
+    Bitmap maskBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888); // hard coded.. the dimensions..
+    fillZeroes(mSegmentBits);
+
+    // output.flip();
+    mSegmentColors = new int[NUM_CLASSES];
+        for (int a = 0; a < NUM_CLASSES; a++) {
+            if (a == 0) {
+                mSegmentColors[a] = Color.TRANSPARENT;
+                // mSegmentColors[a] = Color.BLACK; // when you have the background as black ... now whole bitmap is a mask and nothing actually blurs...
+            } else {
+                mSegmentColors[a] = Color.rgb(
+                        (int)(255 * RANDOM.nextFloat()),
+                        (int)(255 * RANDOM.nextFloat()),
+                        (int)(255 * RANDOM.nextFloat()));
+            }
+        }
+    
+    float maxVal = 0;
+        float val = 0;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                mSegmentBits[x][y] = 0;
+
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    val = output.getFloat((y * w * NUM_CLASSES + x * NUM_CLASSES + c) * BYTES_PER_CHANNEL);
+                    if (c == 0 || val > maxVal) {
+                        maxVal = val;
+                        mSegmentBits[x][y] = c;
+                    }
+                }
+
+                maskBitmap.setPixel(x, y, mSegmentColors[mSegmentBits[x][y]]);
+            }
+        }
+
+    Log.i("Tflite","maskBitmap from output.. width 257 and height 257" + maskBitmap.getWidth() + "---" + maskBitmap.getHeight());
+    // guess this is where we we rescale the image back to 1600 * 1200
+    
+    maskBitmap = BitmapUtils.createClippedBitmap(maskBitmap,
+                    (maskBitmap.getWidth() - 257) / 2,
+                    (maskBitmap.getHeight() - 193) / 2,
+                    257, 193); // rw and rh values.. hardcoded..
+    Log.i("Tflite","maskBitmap from output after resizing to.. width 257 and height 193" + maskBitmap.getWidth() + "---" + maskBitmap.getHeight());
+    maskBitmap = BitmapUtils.scaleBitmap(maskBitmap, 1600, 1200); // hard coded.. original dimensions..
+    //// we need to convert this back to bytebuffer...
+    Log.i("Tflite","maskBitmap from output after rescaling  to.. width 1600 and height 1200" + maskBitmap.getWidth() + "---" + maskBitmap.getHeight());
+
+    // byte[] res = fetchArgmax(output, labelColors, outputType);
+    
+    // do the crop and blur thing... 
+    //
+    //
+    InputStream inputStream = new FileInputStream(path.replace("file://", ""));
+    Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+
+    final Bitmap cropped = cropBitmapWithMask(bitmap, maskBitmap);
+
+    byte[] res = compressPNG(cropped);
+
     String base64String = Base64.encodeToString(res, Base64.NO_WRAP);
+    Log.i("Tflite","base64String bytes.length--" + base64String.length());
+    // doesn't log everything if u try to .. so mind this.. length.. base64String.length()
 
     callback.invoke(null, base64String);
   }
+
+  private void fillZeroes(int[][] array) {
+    if (array == null) {
+        return;
+    }
+
+    int r;
+    for (r = 0; r < array.length; r++) {
+        Arrays.fill(array[r], 0);
+    }
+}
+// for android.support.v8.renderscript.RenderScript; to work we need to change the gradle file of the app/build.gradle and
+// also the local build.gradle...
+
+private Bitmap cropBitmapWithMask(Bitmap original, Bitmap mask) {
+  if (original == null
+          || mask == null) {
+      return null;
+  }
+
+  final int w = original.getWidth();
+  final int h = original.getHeight();
+  if (w <= 0 || h <= 0) {
+      return null;
+  }
+
+  Bitmap cropped = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+  Canvas canvas = new Canvas(cropped);
+  Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+  paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_IN));
+  canvas.drawBitmap(original, 0, 0, null);
+  canvas.drawBitmap(mask, 0, 0, paint); // you will get the original image which is cropped based on mask
+  paint.setXfermode(null);
+  // return cropped;
+
+  Paint paint1 = new Paint(Paint.ANTI_ALIAS_FLAG);
+  // paint1.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_OVER));
+  paint1.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.XOR));
+  // here.. it's effecting the original image aswell so.. the mask part is alos getting blurred
+  // so we need to make a new copy of the image and work on it to blur it..
+
+  Bitmap bmp1 = original;
+  //then create a copy of bitmap bmp1 into bmp2
+  Bitmap bmp2 = bmp1.copy(bmp1.getConfig(), true);
+  Bitmap blurImage = blur(reactContext, bmp2); 
+  Canvas canvas1 = new Canvas(blurImage); // new whole image which is blurred on the canvas
+  canvas1.drawBitmap(mask, 0, 0, paint1); // now the blur image has a mask shaped hole as we used XOR 
+  canvas1.drawBitmap(cropped, 0, 0, paint); // here we got the expected output.. // this has to be cropped.... i donno it works.. that way
+  paint1.setXfermode(null);
+  return blurImage;
+}
+
+public static Bitmap blur( ReactApplicationContext context, Bitmap image) {
+  int width = Math.round(image.getWidth());
+  int height = Math.round(image.getHeight());
+  Bitmap inputBitmap = Bitmap.createScaledBitmap(image, width, height, false);
+  Bitmap outputBitmap = Bitmap.createBitmap(inputBitmap);
+  RenderScript rs = RenderScript.create(context);
+  ScriptIntrinsicBlur theIntrinsic = ScriptIntrinsicBlur.create(rs, Element.U8_4(rs));
+  Allocation tmpIn = Allocation.createFromBitmap(rs, inputBitmap);
+  Allocation tmpOut = Allocation.createFromBitmap(rs, outputBitmap);
+  theIntrinsic.setRadius(10.5f);
+  theIntrinsic.setInput(tmpIn);
+  theIntrinsic.forEach(tmpOut);
+  tmpOut.copyTo(outputBitmap);
+  return outputBitmap;
+}
 
   String[] partNames = {
       "nose", "leftEye", "rightEye", "leftEar", "rightEar", "leftShoulder",
